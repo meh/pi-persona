@@ -1,0 +1,10 @@
+{
+  "name": "pi-persona",
+  "version": "0.1.0",
+  "description": "Persona management extension for pi",
+  "keywords": ["pi-package"],
+  "pi": {
+    "extensions": ["./index.ts"],
+    "skills": ["./skills"]
+  }
+}
