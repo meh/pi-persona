@@ -57,6 +57,8 @@ interface PersonaConfig {
 	postNReinforce: NReinforce[];
 	/** Appended to system prompt (skill descriptions / guidance) */
 	skills: string | null;
+	/** Absolute paths to tool definition files in tools/ */
+	toolFiles: string[];
 }
 
 type AnyMessage = { role: string;[key: string]: unknown };
@@ -115,6 +117,17 @@ function loadPersona(basePath: string, name: string): PersonaConfig {
 
 	const skills = readIfExists(path.join(basePath, "SKILLS.md"));
 
+	const toolsDir = path.join(basePath, "tools");
+	const toolFiles: string[] = [];
+	if (fs.existsSync(toolsDir)) {
+		for (const entry of fs.readdirSync(toolsDir, { withFileTypes: true })) {
+			if (entry.isFile() && (entry.name.endsWith(".ts") || entry.name.endsWith(".js"))) {
+				toolFiles.push(path.join(toolsDir, entry.name));
+			}
+		}
+		toolFiles.sort();
+	}
+
 	return {
 		name,
 		basePath,
@@ -125,6 +138,7 @@ function loadPersona(basePath: string, name: string): PersonaConfig {
 		preNReinforce,
 		postNReinforce,
 		skills,
+		toolFiles,
 	};
 }
 
@@ -234,6 +248,16 @@ function describeChanges(prev: PersonaConfig, next: PersonaConfig): string[] {
 		if (!nextPostN.has(n)) changes.push(`- post/${n}/REINFORCE`);
 	}
 
+	// Tool files (additions / removals only; modified files detected by watcher)
+	const prevToolNames = new Set(prev.toolFiles.map((f) => path.basename(f)));
+	const nextToolNames = new Set(next.toolFiles.map((f) => path.basename(f)));
+	for (const f of nextToolNames) {
+		if (!prevToolNames.has(f)) changes.push(`+ tools/${f}`);
+	}
+	for (const f of prevToolNames) {
+		if (!nextToolNames.has(f)) changes.push(`- tools/${f}`);
+	}
+
 	return changes;
 }
 
@@ -246,12 +270,13 @@ const DEBOUNCE_MS = 1000;
 class PersonaWatcher {
 	private watcher: fs.FSWatcher | null = null;
 	private debounceTimer: ReturnType<typeof setTimeout> | null = null;
+	private pendingToolsChanged = false;
 	private persona: PersonaConfig;
-	private onReload: (next: PersonaConfig, changes: string[]) => void;
+	private onReload: (next: PersonaConfig, changes: string[], toolsChanged: boolean) => void;
 
 	constructor(
 		persona: PersonaConfig,
-		onReload: (next: PersonaConfig, changes: string[]) => void,
+		onReload: (next: PersonaConfig, changes: string[], toolsChanged: boolean) => void,
 	) {
 		this.persona = persona;
 		this.onReload = onReload;
@@ -264,9 +289,12 @@ class PersonaWatcher {
 				this.persona.basePath,
 				{ recursive: true },
 				(_event, filename) => {
-					// Only react to .md files
-					if (filename && !String(filename).endsWith(".md")) return;
-					this.scheduleReload();
+					const fname = String(filename ?? "");
+					if (fname.endsWith(".md")) {
+						this.scheduleReload(false);
+					} else if (fname.endsWith(".ts") || fname.endsWith(".js")) {
+						this.scheduleReload(true);
+					}
 				},
 			);
 			this.watcher.on("error", () => this.stop());
@@ -275,15 +303,18 @@ class PersonaWatcher {
 		}
 	}
 
-	private scheduleReload(): void {
+	private scheduleReload(toolsChanged: boolean): void {
+		this.pendingToolsChanged = this.pendingToolsChanged || toolsChanged;
 		if (this.debounceTimer) clearTimeout(this.debounceTimer);
 		this.debounceTimer = setTimeout(() => {
 			this.debounceTimer = null;
+			const toolsChangedSnapshot = this.pendingToolsChanged;
+			this.pendingToolsChanged = false;
 			const prev = this.persona;
 			const next = loadPersona(prev.basePath, prev.name);
 			const changes = describeChanges(prev, next);
 			this.persona = next;
-			this.onReload(next, changes);
+			this.onReload(next, changes, toolsChangedSnapshot);
 		}, DEBOUNCE_MS);
 	}
 
@@ -303,6 +334,8 @@ class PersonaWatcher {
 // Extension entry point
 // ---------------------------------------------------------------------------
 
+type ToolDefinition = Parameters<ExtensionAPI["registerTool"]>[0];
+
 export default function personaExtension(pi: ExtensionAPI) {
 	let activePersona: PersonaConfig | null = null;
 	let activeCwd = "";
@@ -310,6 +343,11 @@ export default function personaExtension(pi: ExtensionAPI) {
 	// UI reference kept fresh by every event/command so the watcher callback
 	// can fire notifications outside of handler context.
 	let ui: MinimalUI | null = null;
+
+	// Tool state: names registered by the active persona, and the active-tool
+	// snapshot captured just before the persona was activated.
+	let personaToolNames: string[] = [];
+	let savedActiveTools: string[] | null = null;
 
 	const CUSTOM_TYPE = "pi-persona-state";
 
@@ -324,10 +362,76 @@ export default function personaExtension(pi: ExtensionAPI) {
 
 	// ── Watcher lifecycle ─────────────────────────────────────────────────────
 
+	async function activatePersonaTools(persona: PersonaConfig): Promise<void> {
+		if (persona.toolFiles.length === 0) return;
+
+		// Snapshot the current active tool set before adding persona tools
+		savedActiveTools = pi.getActiveTools().map((t) => t.name);
+
+		const newNames: string[] = [];
+		for (const toolFile of persona.toolFiles) {
+			try {
+				// Dynamic import - jiti (the extension loader) handles .ts files.
+				// Note: edits to existing tool files require /reload to pick up;
+				// adding or removing files in tools/ works without /reload.
+				const mod = await import(toolFile) as { default?: unknown };
+				const toolDef = mod.default as ToolDefinition | undefined;
+				if (
+					toolDef &&
+					typeof toolDef.name === "string" &&
+					typeof toolDef.execute === "function"
+				) {
+					pi.registerTool(toolDef);
+					newNames.push(toolDef.name);
+				} else {
+					ui?.notify(
+						`Persona tool "${path.basename(toolFile)}": default export must be a tool definition with name + execute`,
+						"warning",
+					);
+				}
+			} catch (e) {
+				ui?.notify(
+					`Failed to load persona tool "${path.basename(toolFile)}": ${(e as Error).message}`,
+					"error",
+				);
+			}
+		}
+
+		personaToolNames = newNames;
+		if (newNames.length > 0) {
+			pi.setActiveTools([...(savedActiveTools ?? []), ...newNames]);
+		}
+	}
+
+	function deactivatePersonaTools(): void {
+		if (personaToolNames.length === 0) return;
+		if (savedActiveTools !== null) {
+			pi.setActiveTools(savedActiveTools);
+		}
+		personaToolNames = [];
+		savedActiveTools = null;
+	}
+
 	function startWatcher(persona: PersonaConfig): void {
 		watcher?.stop();
-		watcher = new PersonaWatcher(persona, (next, changes) => {
+		watcher = new PersonaWatcher(persona, async (next, changes, toolsChanged) => {
 			activePersona = next;
+
+			// Re-register tools if a .ts/.js file was modified, or files added/removed
+			if (toolsChanged || changes.some((c) => c.includes("tools/"))) {
+				// Rebase: remove old persona tools from baseline, then reload fresh
+				const baseActive = pi
+					.getActiveTools()
+					.map((t) => t.name)
+					.filter((n) => !personaToolNames.includes(n));
+				savedActiveTools = baseActive;
+				personaToolNames = [];
+				await activatePersonaTools(next);
+				if (toolsChanged && !changes.some((c) => c.includes("tools/"))) {
+					changes.push("~ tools/* (use /reload for content edits)");
+				}
+			}
+
 			if (changes.length === 0) return; // No meaningful diff
 			const summary = changes.join(", ");
 			ui?.notify(`Persona "${next.name}" auto-reloaded: ${summary}`, "info");
@@ -362,6 +466,7 @@ export default function personaExtension(pi: ExtensionAPI) {
 					if (basePath) {
 						activePersona = loadPersona(basePath, data.name);
 						startWatcher(activePersona);
+						await activatePersonaTools(activePersona);
 						ctx.ui.notify(`Persona restored: "${data.name}"`, "info");
 					}
 				}
@@ -423,6 +528,7 @@ export default function personaExtension(pi: ExtensionAPI) {
 			// ── off ──
 			if (cmd === "off" || cmd === "none") {
 				stopWatcher();
+				deactivatePersonaTools();
 				activePersona = null;
 				pi.appendEntry(CUSTOM_TYPE, { name: null });
 				updateStatus();
@@ -443,8 +549,10 @@ export default function personaExtension(pi: ExtensionAPI) {
 			}
 
 			stopWatcher();
+			deactivatePersonaTools();
 			activePersona = loadPersona(basePath, cmd);
 			startWatcher(activePersona);
+			await activatePersonaTools(activePersona);
 			pi.appendEntry(CUSTOM_TYPE, { name: cmd });
 			updateStatus();
 
@@ -459,6 +567,8 @@ export default function personaExtension(pi: ExtensionAPI) {
 				parts.push(`pre/${n}/REINFORCE`);
 			for (const { n } of activePersona.postNReinforce)
 				parts.push(`post/${n}/REINFORCE`);
+			for (const n of personaToolNames)
+				parts.push(`tools/${n}`);
 
 			ctx.ui.notify(
 				`Persona "${cmd}" activated.` +
